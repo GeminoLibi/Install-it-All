@@ -91,7 +91,7 @@ PYTHON_PACKAGES = [
     "python-nmap", "python-whois",
     "shodan", "censys", "virustotal-api",
     "yara-python", "pefile", "capstone",
-    "keystone-engine", "unicorn",
+    "keystone-engine", "unicorn","scoop",
 ]
 
 NODE_PACKAGES = [
