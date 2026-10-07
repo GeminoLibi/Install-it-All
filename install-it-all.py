@@ -215,16 +215,64 @@ JOHN_ZIP_URL = "https://github.com/openwall/john-packages/releases/latest/downlo
 JOHN_ROOT = r"C:\Tools\john"
 
 
-def setup_logging():
-    """Setup comprehensive debug logging"""
-    log_filename = f"install_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+def _is_drive_root(path):
+    """True for paths like C:\\ where a normal account cannot create files."""
+    drive, tail = os.path.splitdrive(os.path.abspath(path))
+    return bool(drive) and tail.strip("\\/") == ""
+
+
+def _can_write_directory(directory):
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".install_it_all_write_test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def log_directory(script_dir):
+    """Pick a directory this account can write a log into.
+
+    The script is often launched from a drive root such as C:\\. That
+    location rejects new files until the process is elevated, and it is a
+    poor place for logs even afterward.
+    """
+    candidates = []
+    if script_dir and not _is_drive_root(script_dir):
+        candidates.append(script_dir)
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        candidates.append(os.path.join(local_app, "Install-It-All"))
+    for name in ("TEMP", "TMP"):
+        temp = os.environ.get(name)
+        if temp:
+            candidates.append(temp)
+    for directory in candidates:
+        if _can_write_directory(directory):
+            return directory
+    return None
+
+
+def setup_logging(log_dir=None):
+    """Setup comprehensive debug logging. Console logging still works if the file cannot be opened."""
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_filename = None
+    if log_dir:
+        log_filename = os.path.join(
+            log_dir, f"install_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        try:
+            handlers.insert(0, logging.FileHandler(log_filename, encoding="utf-8"))
+        except OSError as error:
+            print(f"[warn] Could not open the log file: {error}")
+            log_filename = None
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
     )
     return log_filename
 
@@ -233,6 +281,8 @@ def debug_log(message, level="INFO"):
     """Log debug message with timestamp"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {level}: {message}")
+    if not logging.getLogger().handlers:
+        return
     if level == "DEBUG":
         logging.debug(message)
     elif level == "INFO":
@@ -1162,15 +1212,29 @@ def discover_cloudflare_resources():
 def main():
     """Main installation process - comprehensive toolkit setup"""
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    if script_dir:
+
+    # Ask for administrator permission before creating any files. A launch
+    # from C:\ cannot create the debug log until the process is elevated.
+    if not is_admin():
+        print("Comprehensive toolkit installer")
+        if not run_as_admin():
+            print("[fail] Cannot proceed without administrator privileges.")
+            input("Press Enter to exit...")
+        return
+
+    if script_dir and not _is_drive_root(script_dir):
         try:
             os.chdir(script_dir)
         except OSError as error:
             print(f"[warn] Could not switch to the script directory: {error}")
 
-    log_filename = setup_logging()
+    log_dir = log_directory(script_dir)
+    log_filename = setup_logging(log_dir)
     debug_log("Starting comprehensive toolkit installer", "INFO")
-    debug_log(f"Debug log file: {log_filename}", "INFO")
+    if log_filename:
+        debug_log(f"Debug log file: {log_filename}", "INFO")
+    else:
+        debug_log("No writable log directory found; continuing with console output", "WARNING")
     debug_log(f"Python version: {sys.version}", "DEBUG")
     debug_log(f"Script arguments: {sys.argv}", "DEBUG")
     debug_log(f"Current working directory: {os.getcwd()}", "DEBUG")
@@ -1180,16 +1244,6 @@ def main():
     print("Installs a coding, cybersecurity, and pentesting toolkit.")
     print("Sources: winget, Scoop main/extras, pip, and npm.")
     print("=" * 80)
-
-    debug_log("Checking administrator privileges", "INFO")
-    if not is_admin():
-        debug_log("Not running as admin, attempting to restart", "WARNING")
-        if not run_as_admin():
-            debug_log("Failed to restart as administrator", "ERROR")
-            print("[fail] Cannot proceed without administrator privileges.")
-            input("Press Enter to exit...")
-            return
-        return
 
     debug_log("Confirmed running as administrator", "INFO")
     print("[ok] Running as administrator")
@@ -1323,7 +1377,10 @@ def main():
     print("2. Open VS Code, or Cursor if its CLI is installed, and check the extensions")
     print("3. Check languages: node --version, python --version, go version, rustc --version, java -version")
     print("4. Check security tools: nmap --version, tshark --version, hashcat --version, john, msfconsole")
-    print(f"5. Read the debug log: {log_filename}")
+    if log_filename:
+        print(f"5. Read the debug log: {log_filename}")
+    else:
+        print("5. No debug log file was written; the messages above are the record")
     print("=" * 80)
 
     debug_log("Installation completed, waiting for user input", "DEBUG")
