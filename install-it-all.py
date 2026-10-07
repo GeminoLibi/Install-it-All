@@ -244,10 +244,10 @@ def debug_log(message, level="INFO"):
 
 
 def is_admin():
-    """Check if script is running as administrator"""
+    """Check if this process token is elevated."""
     debug_log("Checking administrator privileges...", "DEBUG")
     try:
-        result = ctypes.windll.shell32.IsUserAnAdmin()
+        result = bool(ctypes.windll.shell32.IsUserAnAdmin())
         debug_log(f"Admin check result: {result}", "DEBUG")
         return result
     except Exception as e:
@@ -255,25 +255,152 @@ def is_admin():
         return False
 
 
+def _is_store_python(executable):
+    """The Microsoft Store python alias cannot be started with runas."""
+    normalized = os.path.abspath(executable).replace("/", "\\").lower()
+    return "\\windowsapps\\" in normalized
+
+
+def elevation_target():
+    """Executable and arguments for the elevated relaunch.
+
+    Store-alias python.exe fails ShellExecute runas with access denied.
+    The py launcher installed under Windows can be elevated.
+    """
+    executable = os.path.abspath(sys.executable)
+    prefix = []
+    if _is_store_python(executable):
+        launcher = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "py.exe")
+        if os.path.isfile(launcher):
+            debug_log(f"Store Python cannot be elevated; using {launcher}", "WARNING")
+            executable = launcher
+            prefix = ["-3"]
+        else:
+            debug_log("Store Python cannot be elevated and py.exe was not found", "ERROR")
+    script = os.path.abspath(sys.argv[0])
+    return executable, prefix + [script] + sys.argv[1:]
+
+
+def elevation_directory():
+    """A directory the elevated token is allowed to use as its start folder.
+
+    Passing the caller's current directory as the start folder makes
+    ShellExecute return access denied when that folder is not available to
+    the elevated token. Windows itself is always available.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    if os.path.isdir(system_root):
+        return system_root
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if script_dir and os.path.isdir(script_dir):
+        return script_dir
+    return system_root
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def powershell_runas(executable, arguments, directory):
+    """Show the UAC prompt through Start-Process -Verb RunAs."""
+    arg_list = ", ".join(_ps_quote(arg) for arg in arguments)
+    command = (
+        f"Start-Process -FilePath {_ps_quote(executable)} "
+        f"-WorkingDirectory {_ps_quote(directory)} "
+        f"-Verb RunAs -ArgumentList @({arg_list})"
+    )
+    debug_log(f"PowerShell elevation command: {command}", "DEBUG")
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as e:
+        debug_log(f"PowerShell was not available for elevation: {e}", "WARNING")
+        return False, str(e)
+    detail = (result.stderr or result.stdout or "").strip()
+    debug_log(f"PowerShell elevation exit {result.returncode}: {detail}", "DEBUG")
+    return result.returncode == 0, detail
+
+
+def shell_execute_runas(executable, arguments, directory):
+    """Fallback UAC relaunch. Returns (ok, code). Codes at or below 32 are failures."""
+    parameters = subprocess.list2cmdline(arguments)
+    debug_log(f"ShellExecute runas: {executable} {parameters} (dir {directory})", "DEBUG")
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        ctypes.set_last_error(0)
+        result = shell32.ShellExecuteW(None, "runas", executable, parameters, directory, 1)
+    except Exception as e:
+        debug_log(f"ShellExecute runas failed: {e}", "ERROR")
+        return False, 0
+    code = 0 if not result else int(result)
+    if code > 32:
+        return True, code
+    last_error = ctypes.get_last_error()
+    failure = code or last_error
+    debug_log(f"ShellExecute runas failed with code {failure}", "WARNING")
+    return False, failure
+
+
+def _elevation_was_cancelled(detail):
+    text = (detail or "").lower()
+    return "canceled by the user" in text or "cancelled by the user" in text
+
+
 def run_as_admin():
-    """Restart script as administrator"""
+    """Relaunch this script with a UAC prompt. The current process should then exit."""
     debug_log("Attempting to restart as administrator...", "INFO")
     if is_admin():
         debug_log("Already running as administrator", "INFO")
         return True
 
-    debug_log("This script requires administrator privileges.", "WARNING")
-    debug_log("Restarting as administrator...", "INFO")
-    try:
-        debug_log(f"Executing: {sys.executable} {' '.join(sys.argv)}", "DEBUG")
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
-        )
-        debug_log("Successfully restarted as administrator", "INFO")
+    executable, arguments = elevation_target()
+    directory = elevation_directory()
+    debug_log(f"Elevation target: {executable} {arguments}", "DEBUG")
+    debug_log(f"Elevation directory: {directory}", "DEBUG")
+    print("Administrator permission is required.")
+    print("Windows will ask you to allow this installer. Choose Yes.")
+    sys.stdout.flush()
+
+    ok, detail = powershell_runas(executable, arguments, directory)
+    if ok:
+        debug_log("Administrator window opened", "INFO")
+        print("Opened an administrator window. You can close this one.")
         return True
-    except Exception as e:
-        debug_log(f"Failed to restart as administrator: {e}", "ERROR")
+    if _elevation_was_cancelled(detail):
+        debug_log("User declined the administrator prompt", "WARNING")
+        print("[fail] Administrator permission was not granted.")
         return False
+
+    debug_log(f"PowerShell elevation did not open a window: {detail}", "WARNING")
+    ok, code = shell_execute_runas(executable, arguments, directory)
+    if ok:
+        debug_log("Administrator window opened with ShellExecute", "INFO")
+        print("Opened an administrator window. You can close this one.")
+        return True
+
+    if code in (5, 1223) or "access is denied" in (detail or "").lower():
+        reason = "access denied"
+    else:
+        reason = detail or f"error {code}"
+    debug_log(f"Failed to restart as administrator: {reason}", "ERROR")
+    print(f"[fail] Could not request administrator permission ({reason}).")
+    if _is_store_python(sys.executable):
+        print("The python command is the Microsoft Store alias, which Windows will not elevate.")
+        print("Install Python from python.org, or run this from an elevated terminal:")
+        print("  py -3 install-it-all.py")
+    return False
 
 
 def run_command(command, description, allow_failure=False, timeout=None):
@@ -1034,6 +1161,13 @@ def discover_cloudflare_resources():
 
 def main():
     """Main installation process - comprehensive toolkit setup"""
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if script_dir:
+        try:
+            os.chdir(script_dir)
+        except OSError as error:
+            print(f"[warn] Could not switch to the script directory: {error}")
+
     log_filename = setup_logging()
     debug_log("Starting comprehensive toolkit installer", "INFO")
     debug_log(f"Debug log file: {log_filename}", "INFO")
