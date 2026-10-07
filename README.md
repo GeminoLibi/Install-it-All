@@ -20,7 +20,7 @@ Install-It-All is a Windows installer for a coding, cybersecurity, and pentestin
 
 This script will:
 
-1. **Verify administrative privileges**
+1. **Request administrator permission** if the window is not already elevated, then continue in that elevated window
 2. **Install core languages and editors with winget**
 3. **Reload PATH from the registry** and install the stable Rust toolchain when rustup is new
 4. **Install CLI, container, database, and cloud tools**
@@ -35,7 +35,7 @@ This script will:
 13. **List Cloudflare resources** when the Wrangler CLI is on PATH and already logged in
 14. **Print a summary** with restart notes and the log path
 
-Everything is logged to a timestamped debug file. A failed interactive command asks whether to continue. Per-package winget and Scoop failures are logged and skipped.
+Everything is logged to a timestamped debug file. The file is written next to the script when that folder is writable. If the script is on a drive root such as `C:\`, the log goes to `%LOCALAPPDATA%\Install-It-All` instead. A failed interactive command asks whether to continue. Per-package winget and Scoop failures are logged and skipped.
 
 ---
 
@@ -59,7 +59,7 @@ git clone https://github.com/GeminoLibi/Install-it-All.git
 cd Install-it-All
 ```
 
-Run as admin (either from an elevated shell, or the script will relaunch itself with UAC):
+Run it from a normal terminal. If the window is not already elevated, Windows asks for administrator permission and the script continues in a new window:
 
 ```sh
 python install-it-all.py
@@ -153,9 +153,11 @@ Scoop packages must exist in the official `main` or `extras` bucket. The script 
 
 ## Troubleshooting
 
-- **Can't run some commands?** Use an administrator shell. The script relaunches with UAC when it is not elevated.
+- **Access denied as soon as it starts?** Approve the administrator prompt. The script relaunches itself with UAC; it does not keep running in the window that Windows refused to elevate. If the prompt never appears and the `python` command is the Microsoft Store alias, install Python from python.org or run `py -3 install-it-all.py`.
+- **Can't run some commands later?** The installer has to stay in that administrator window. A second, non-elevated terminal will not see the same permissions.
 - **Winget or Python not available?** Install those before running this script.
-- **A package failed?** Check `install_debug_<timestamp>.log`. Winget ids are exact (`--id` and `-e`), so a renamed package fails instead of installing a different one.
+- **A package failed?** Check `install_debug_<timestamp>.log` next to the script, or under `%LOCALAPPDATA%\Install-It-All` when the script folder cannot accept new files. Winget ids are exact (`--id` and `-e`), so a renamed package fails instead of installing a different one.
+- **Permission denied creating `C:\install_debug_....log`?** That was the log being opened before elevation. Run the current script; it asks for administrator permission first and does not write the log on the drive root.
 - **Scoop failed?** The installer is the official `get.scoop.sh` script with `-RunAsAdmin`, which is required because this run is elevated.
 - **Nmap capture does not work?** Npcap has to be installed. The script runs the Npcap installer shipped inside Scoop's Nmap app when `C:\Program Files\Npcap` is missing. If that file is not in the bundle, install Npcap by hand.
 - **Ghidra does not start?** It needs JDK 21 on PATH. The script installs Temurin 21 before Scoop's Ghidra package. Restart the terminal after the run.

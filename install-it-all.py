@@ -215,16 +215,64 @@ JOHN_ZIP_URL = "https://github.com/openwall/john-packages/releases/latest/downlo
 JOHN_ROOT = r"C:\Tools\john"
 
 
-def setup_logging():
-    """Setup comprehensive debug logging"""
-    log_filename = f"install_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+def _is_drive_root(path):
+    """True for paths like C:\\ where a normal account cannot create files."""
+    drive, tail = os.path.splitdrive(os.path.abspath(path))
+    return bool(drive) and tail.strip("\\/") == ""
+
+
+def _can_write_directory(directory):
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".install_it_all_write_test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def log_directory(script_dir):
+    """Pick a directory this account can write a log into.
+
+    The script is often launched from a drive root such as C:\\. That
+    location rejects new files until the process is elevated, and it is a
+    poor place for logs even afterward.
+    """
+    candidates = []
+    if script_dir and not _is_drive_root(script_dir):
+        candidates.append(script_dir)
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        candidates.append(os.path.join(local_app, "Install-It-All"))
+    for name in ("TEMP", "TMP"):
+        temp = os.environ.get(name)
+        if temp:
+            candidates.append(temp)
+    for directory in candidates:
+        if _can_write_directory(directory):
+            return directory
+    return None
+
+
+def setup_logging(log_dir=None):
+    """Setup comprehensive debug logging. Console logging still works if the file cannot be opened."""
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_filename = None
+    if log_dir:
+        log_filename = os.path.join(
+            log_dir, f"install_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        try:
+            handlers.insert(0, logging.FileHandler(log_filename, encoding="utf-8"))
+        except OSError as error:
+            print(f"[warn] Could not open the log file: {error}")
+            log_filename = None
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
     )
     return log_filename
 
@@ -233,6 +281,8 @@ def debug_log(message, level="INFO"):
     """Log debug message with timestamp"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {level}: {message}")
+    if not logging.getLogger().handlers:
+        return
     if level == "DEBUG":
         logging.debug(message)
     elif level == "INFO":
@@ -244,10 +294,10 @@ def debug_log(message, level="INFO"):
 
 
 def is_admin():
-    """Check if script is running as administrator"""
+    """Check if this process token is elevated."""
     debug_log("Checking administrator privileges...", "DEBUG")
     try:
-        result = ctypes.windll.shell32.IsUserAnAdmin()
+        result = bool(ctypes.windll.shell32.IsUserAnAdmin())
         debug_log(f"Admin check result: {result}", "DEBUG")
         return result
     except Exception as e:
@@ -255,25 +305,152 @@ def is_admin():
         return False
 
 
+def _is_store_python(executable):
+    """The Microsoft Store python alias cannot be started with runas."""
+    normalized = os.path.abspath(executable).replace("/", "\\").lower()
+    return "\\windowsapps\\" in normalized
+
+
+def elevation_target():
+    """Executable and arguments for the elevated relaunch.
+
+    Store-alias python.exe fails ShellExecute runas with access denied.
+    The py launcher installed under Windows can be elevated.
+    """
+    executable = os.path.abspath(sys.executable)
+    prefix = []
+    if _is_store_python(executable):
+        launcher = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "py.exe")
+        if os.path.isfile(launcher):
+            debug_log(f"Store Python cannot be elevated; using {launcher}", "WARNING")
+            executable = launcher
+            prefix = ["-3"]
+        else:
+            debug_log("Store Python cannot be elevated and py.exe was not found", "ERROR")
+    script = os.path.abspath(sys.argv[0])
+    return executable, prefix + [script] + sys.argv[1:]
+
+
+def elevation_directory():
+    """A directory the elevated token is allowed to use as its start folder.
+
+    Passing the caller's current directory as the start folder makes
+    ShellExecute return access denied when that folder is not available to
+    the elevated token. Windows itself is always available.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    if os.path.isdir(system_root):
+        return system_root
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if script_dir and os.path.isdir(script_dir):
+        return script_dir
+    return system_root
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def powershell_runas(executable, arguments, directory):
+    """Show the UAC prompt through Start-Process -Verb RunAs."""
+    arg_list = ", ".join(_ps_quote(arg) for arg in arguments)
+    command = (
+        f"Start-Process -FilePath {_ps_quote(executable)} "
+        f"-WorkingDirectory {_ps_quote(directory)} "
+        f"-Verb RunAs -ArgumentList @({arg_list})"
+    )
+    debug_log(f"PowerShell elevation command: {command}", "DEBUG")
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as e:
+        debug_log(f"PowerShell was not available for elevation: {e}", "WARNING")
+        return False, str(e)
+    detail = (result.stderr or result.stdout or "").strip()
+    debug_log(f"PowerShell elevation exit {result.returncode}: {detail}", "DEBUG")
+    return result.returncode == 0, detail
+
+
+def shell_execute_runas(executable, arguments, directory):
+    """Fallback UAC relaunch. Returns (ok, code). Codes at or below 32 are failures."""
+    parameters = subprocess.list2cmdline(arguments)
+    debug_log(f"ShellExecute runas: {executable} {parameters} (dir {directory})", "DEBUG")
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        ctypes.set_last_error(0)
+        result = shell32.ShellExecuteW(None, "runas", executable, parameters, directory, 1)
+    except Exception as e:
+        debug_log(f"ShellExecute runas failed: {e}", "ERROR")
+        return False, 0
+    code = 0 if not result else int(result)
+    if code > 32:
+        return True, code
+    last_error = ctypes.get_last_error()
+    failure = code or last_error
+    debug_log(f"ShellExecute runas failed with code {failure}", "WARNING")
+    return False, failure
+
+
+def _elevation_was_cancelled(detail):
+    text = (detail or "").lower()
+    return "canceled by the user" in text or "cancelled by the user" in text
+
+
 def run_as_admin():
-    """Restart script as administrator"""
+    """Relaunch this script with a UAC prompt. The current process should then exit."""
     debug_log("Attempting to restart as administrator...", "INFO")
     if is_admin():
         debug_log("Already running as administrator", "INFO")
         return True
 
-    debug_log("This script requires administrator privileges.", "WARNING")
-    debug_log("Restarting as administrator...", "INFO")
-    try:
-        debug_log(f"Executing: {sys.executable} {' '.join(sys.argv)}", "DEBUG")
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
-        )
-        debug_log("Successfully restarted as administrator", "INFO")
+    executable, arguments = elevation_target()
+    directory = elevation_directory()
+    debug_log(f"Elevation target: {executable} {arguments}", "DEBUG")
+    debug_log(f"Elevation directory: {directory}", "DEBUG")
+    print("Administrator permission is required.")
+    print("Windows will ask you to allow this installer. Choose Yes.")
+    sys.stdout.flush()
+
+    ok, detail = powershell_runas(executable, arguments, directory)
+    if ok:
+        debug_log("Administrator window opened", "INFO")
+        print("Opened an administrator window. You can close this one.")
         return True
-    except Exception as e:
-        debug_log(f"Failed to restart as administrator: {e}", "ERROR")
+    if _elevation_was_cancelled(detail):
+        debug_log("User declined the administrator prompt", "WARNING")
+        print("[fail] Administrator permission was not granted.")
         return False
+
+    debug_log(f"PowerShell elevation did not open a window: {detail}", "WARNING")
+    ok, code = shell_execute_runas(executable, arguments, directory)
+    if ok:
+        debug_log("Administrator window opened with ShellExecute", "INFO")
+        print("Opened an administrator window. You can close this one.")
+        return True
+
+    if code in (5, 1223) or "access is denied" in (detail or "").lower():
+        reason = "access denied"
+    else:
+        reason = detail or f"error {code}"
+    debug_log(f"Failed to restart as administrator: {reason}", "ERROR")
+    print(f"[fail] Could not request administrator permission ({reason}).")
+    if _is_store_python(sys.executable):
+        print("The python command is the Microsoft Store alias, which Windows will not elevate.")
+        print("Install Python from python.org, or run this from an elevated terminal:")
+        print("  py -3 install-it-all.py")
+    return False
 
 
 def run_command(command, description, allow_failure=False, timeout=None):
@@ -1034,9 +1211,30 @@ def discover_cloudflare_resources():
 
 def main():
     """Main installation process - comprehensive toolkit setup"""
-    log_filename = setup_logging()
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    # Ask for administrator permission before creating any files. A launch
+    # from C:\ cannot create the debug log until the process is elevated.
+    if not is_admin():
+        print("Comprehensive toolkit installer")
+        if not run_as_admin():
+            print("[fail] Cannot proceed without administrator privileges.")
+            input("Press Enter to exit...")
+        return
+
+    if script_dir and not _is_drive_root(script_dir):
+        try:
+            os.chdir(script_dir)
+        except OSError as error:
+            print(f"[warn] Could not switch to the script directory: {error}")
+
+    log_dir = log_directory(script_dir)
+    log_filename = setup_logging(log_dir)
     debug_log("Starting comprehensive toolkit installer", "INFO")
-    debug_log(f"Debug log file: {log_filename}", "INFO")
+    if log_filename:
+        debug_log(f"Debug log file: {log_filename}", "INFO")
+    else:
+        debug_log("No writable log directory found; continuing with console output", "WARNING")
     debug_log(f"Python version: {sys.version}", "DEBUG")
     debug_log(f"Script arguments: {sys.argv}", "DEBUG")
     debug_log(f"Current working directory: {os.getcwd()}", "DEBUG")
@@ -1046,16 +1244,6 @@ def main():
     print("Installs a coding, cybersecurity, and pentesting toolkit.")
     print("Sources: winget, Scoop main/extras, pip, and npm.")
     print("=" * 80)
-
-    debug_log("Checking administrator privileges", "INFO")
-    if not is_admin():
-        debug_log("Not running as admin, attempting to restart", "WARNING")
-        if not run_as_admin():
-            debug_log("Failed to restart as administrator", "ERROR")
-            print("[fail] Cannot proceed without administrator privileges.")
-            input("Press Enter to exit...")
-            return
-        return
 
     debug_log("Confirmed running as administrator", "INFO")
     print("[ok] Running as administrator")
@@ -1189,7 +1377,10 @@ def main():
     print("2. Open VS Code, or Cursor if its CLI is installed, and check the extensions")
     print("3. Check languages: node --version, python --version, go version, rustc --version, java -version")
     print("4. Check security tools: nmap --version, tshark --version, hashcat --version, john, msfconsole")
-    print(f"5. Read the debug log: {log_filename}")
+    if log_filename:
+        print(f"5. Read the debug log: {log_filename}")
+    else:
+        print("5. No debug log file was written; the messages above are the record")
     print("=" * 80)
 
     debug_log("Installation completed, waiting for user input", "DEBUG")
