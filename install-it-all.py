@@ -44,6 +44,7 @@ DEVELOPMENT_TOOLS = {
         ("Redis.Redis", "Redis", "redis-server --version"),
         ("SQLite.SQLite", "SQLite", "sqlite3 --version"),
         ("DBeaver.DBeaver.Community", "DBeaver Community", None),
+        ("DBBrowserForSQLite.DBBrowserForSQLite", "DB Browser for SQLite", None),
     ],
     "cloud": [
         ("Amazon.AWSCLI", "AWS CLI", "aws --version"),
@@ -63,10 +64,16 @@ SECURITY_TOOLS = {
         ("ZAP.ZAP", "ZAP", "zap -version"),
         ("mitmproxy.mitmproxy", "mitmproxy", "mitmproxy --version"),
         ("ffuf.ffuf", "ffuf", "ffuf -V"),
+        ("Maltego.Maltego", "Maltego", None),
     ],
     "forensics": [
         ("SleuthKit.Autopsy", "Autopsy", None),
+        ("PassMark.OSFMount", "OSFMount", None),
+        ("PassMark.VolatilityWorkbench", "Volatility Workbench", None),
+        ("CGSecurity.TestDisk", "TestDisk and PhotoRec", None),
         ("OliverBetz.ExifTool", "ExifTool", "exiftool -ver"),
+        ("VirusTotal.YARA", "YARA", "yara --version"),
+        ("VirusTotal.vt-cli", "VirusTotal CLI", "vt version"),
         ("UB-Mannheim.TesseractOCR", "Tesseract OCR", "tesseract --version"),
         ("Gyan.FFmpeg", "FFmpeg", "ffmpeg -version"),
         ("Microsoft.WinDbg", "WinDbg", None),
@@ -74,6 +81,9 @@ SECURITY_TOOLS = {
     "reversing": [
         ("x64dbg.x64dbg", "x64dbg", None),
         ("WerWolv.ImHex", "ImHex", None),
+        ("MHNexus.HxD", "HxD", None),
+        ("hasherezade.PE-bear", "PE-bear", None),
+        ("AngusJohnson.ResourceHacker", "Resource Hacker", None),
         ("horsicq.DIE-engine", "Detect It Easy", None),
         ("WinsiderSS.SystemInformer", "System Informer", None),
     ],
@@ -128,6 +138,7 @@ CODING_EXTENSIONS = {
         "ms-vscode.vscode-docker",
         "ms-azuretools.vscode-azurefunctions",
         "ms-azuretools.vscode-azureresourcegroups",
+        "ms-vscode.hexeditor",
         "rust-lang.rust-analyzer",
         "golang.Go",
         "HashiCorp.terraform",
@@ -151,6 +162,8 @@ PYTHON_PACKAGES = [
     "keystone-engine", "unicorn",
     "volatility3", "impacket", "sqlmap",
     "pillow", "exifread", "pypdf",
+    "oletools", "lief", "python-registry", "pywin32",
+    "theHarvester",
     "python-dotenv", "sqlalchemy",
     "psycopg2-binary", "pymongo",
 ]
@@ -179,10 +192,27 @@ SYSTEM_UTILITIES = [
     ("OBSProject.OBSStudio", "OBS Studio", None),
     ("PuTTY.PuTTY", "PuTTY", None),
     ("WinSCP.WinSCP", "WinSCP", None),
+    ("voidtools.Everything", "Everything", None),
 ]
 
 WINGET_TIMEOUT_SECONDS = 900
 SCOOP_TIMEOUT_SECONDS = 1200
+METASPLOIT_TIMEOUT_SECONDS = 1800
+JOHN_TIMEOUT_SECONDS = 900
+
+# Rapid7's documented Windows silent install. INSTALLLOCATION is the drive
+# or parent directory; the MSI creates metasploit-framework underneath it.
+METASPLOIT_MSI_URL = "https://windows.metasploit.com/metasploitframework-latest.msi"
+METASPLOIT_PARENT = r"C:\Tools"
+METASPLOIT_BIN_CANDIDATES = [
+    r"C:\Tools\metasploit-framework\bin",
+    r"C:\metasploit-framework\bin",
+    r"C:\Metasploit-framework\bin",
+]
+
+# Official Openwall Windows build of John the Ripper jumbo.
+JOHN_ZIP_URL = "https://github.com/openwall/john-packages/releases/latest/download/winX64_1_JtR.zip"
+JOHN_ROOT = r"C:\Tools\john"
 
 
 def setup_logging():
@@ -649,6 +679,190 @@ def install_scoop_packages():
     return installed_count, total_count
 
 
+def add_directory_to_machine_path(directory):
+    """Append a directory to the machine PATH when it is not already there."""
+    if os.name != "nt" or not directory or not os.path.isdir(directory):
+        return False
+    import winreg
+
+    subkey = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+    access = winreg.KEY_READ | winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey, 0, access) as key:
+            current, regtype = winreg.QueryValueEx(key, "Path")
+            parts = [part for part in current.split(";") if part]
+            if any(part.lower() == directory.lower() for part in parts):
+                debug_log(f"Machine PATH already contains {directory}", "DEBUG")
+                return True
+            updated = ";".join(parts + [directory])
+            winreg.SetValueEx(key, "Path", 0, regtype, updated)
+    except OSError as e:
+        debug_log(f"Could not update machine PATH: {e}", "ERROR")
+        return False
+    debug_log(f"Added to machine PATH: {directory}", "INFO")
+    return True
+
+
+def find_named_file(root, filename):
+    """Return the first path under root whose file name matches, case-insensitive."""
+    if not root or not os.path.isdir(root):
+        return None
+    target = filename.lower()
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            if name.lower() == target:
+                return os.path.join(dirpath, name)
+    return None
+
+
+def metasploit_console_path():
+    """Path to msfconsole.bat when the framework is installed but not yet on PATH."""
+    for directory in METASPLOIT_BIN_CANDIDATES:
+        candidate = os.path.join(directory, "msfconsole.bat")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def install_metasploit():
+    """Install Metasploit Framework from Rapid7's official Windows MSI."""
+    debug_log("Starting Metasploit Framework install", "INFO")
+    print("\nMetasploit Framework")
+    print("=" * 60)
+    print(f"Source: {METASPLOIT_MSI_URL}")
+    print("The MSI is about 400 MB. Antivirus often quarantines the install.")
+    print(r"If it disappears, exclude C:\Tools\metasploit-framework and C:\metasploit-framework.")
+
+    if check_command_exists("msfconsole") or metasploit_console_path():
+        debug_log("Metasploit is already installed", "INFO")
+        print("[ok] Already installed")
+        console = metasploit_console_path()
+        if console:
+            add_directory_to_machine_path(os.path.dirname(console))
+        return 1, 1
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$DownloadURL = 'https://windows.metasploit.com/metasploitframework-latest.msi'
+$DownloadLocation = Join-Path $env:APPDATA 'Metasploit'
+$LogLocation = Join-Path $DownloadLocation 'install.log'
+New-Item -Path $DownloadLocation -ItemType Directory -Force | Out-Null
+New-Item -Path 'C:\Tools' -ItemType Directory -Force | Out-Null
+$Installer = Join-Path $DownloadLocation 'metasploit.msi'
+Write-Output "Downloading $DownloadURL"
+Invoke-WebRequest -UseBasicParsing -Uri $DownloadURL -OutFile $Installer
+Write-Output "Installing $Installer"
+$proc = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @(
+    '/i', $Installer,
+    '/qn',
+    '/norestart',
+    '/log', $LogLocation,
+    'INSTALLLOCATION=C:\Tools'
+) -Wait -PassThru
+Write-Output "msiexec exit $($proc.ExitCode). Log: $LogLocation"
+exit $proc.ExitCode
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=METASPLOIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        debug_log("Timeout installing Metasploit", "ERROR")
+        print("[warn] Timeout")
+        return 0, 1
+    except Exception as e:
+        debug_log(f"Error installing Metasploit: {e}", "ERROR")
+        print(f"[fail] Error: {e}")
+        return 0, 1
+
+    if result.stdout:
+        debug_log(result.stdout, "DEBUG")
+    if result.stderr:
+        debug_log(result.stderr, "DEBUG")
+
+    # 0 is success. 3010 is success with a reboot requested.
+    if result.returncode in (0, 3010) or metasploit_console_path():
+        console = metasploit_console_path()
+        if console:
+            add_directory_to_machine_path(os.path.dirname(console))
+        refresh_process_path()
+        debug_log("Metasploit installed", "INFO")
+        print("[ok] Installed")
+        return 1, 1
+
+    debug_log(f"Metasploit install failed with exit code {result.returncode}", "ERROR")
+    print(f"[warn] Installation failed (exit {result.returncode})")
+    print(r"See %APPDATA%\Metasploit\install.log")
+    return 0, 1
+
+
+def install_john():
+    """Install the official Openwall Windows build of John the Ripper."""
+    debug_log("Starting John the Ripper install", "INFO")
+    print("\nJohn the Ripper")
+    print("=" * 60)
+    print(f"Source: {JOHN_ZIP_URL}")
+
+    if check_command_exists("john"):
+        debug_log("John the Ripper is already installed", "INFO")
+        print("[ok] Already installed")
+        return 1, 1
+
+    john_exe = find_named_file(JOHN_ROOT, "john.exe")
+    if not john_exe:
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$Dest = 'C:\Tools\john'
+$Zip = Join-Path $env:TEMP 'winX64_1_JtR.zip'
+New-Item -Path 'C:\Tools' -ItemType Directory -Force | Out-Null
+if (Test-Path $Dest) { Remove-Item -Path $Dest -Recurse -Force }
+New-Item -Path $Dest -ItemType Directory -Force | Out-Null
+Write-Output 'Downloading John the Ripper'
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/openwall/john-packages/releases/latest/download/winX64_1_JtR.zip' -OutFile $Zip
+Write-Output 'Extracting John the Ripper'
+Expand-Archive -Path $Zip -DestinationPath $Dest -Force
+"""
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=JOHN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            debug_log("Timeout installing John the Ripper", "ERROR")
+            print("[warn] Timeout")
+            return 0, 1
+        except Exception as e:
+            debug_log(f"Error installing John the Ripper: {e}", "ERROR")
+            print(f"[fail] Error: {e}")
+            return 0, 1
+
+        if result.stdout:
+            debug_log(result.stdout, "DEBUG")
+        if result.stderr:
+            debug_log(result.stderr, "DEBUG")
+        if result.returncode != 0:
+            debug_log(f"John download failed with exit code {result.returncode}", "ERROR")
+            print(f"[warn] Installation failed (exit {result.returncode})")
+            return 0, 1
+        john_exe = find_named_file(JOHN_ROOT, "john.exe")
+
+    if not john_exe:
+        debug_log("john.exe was not found after extraction", "ERROR")
+        print("[warn] john.exe was not in the archive")
+        return 0, 1
+
+    add_directory_to_machine_path(os.path.dirname(john_exe))
+    refresh_process_path()
+    debug_log(f"John the Ripper installed at {john_exe}", "INFO")
+    print("[ok] Installed")
+    return 1, 1
+
+
 def install_python_packages():
     """Install Python packages for development and security"""
     debug_log("Starting Python package installation", "INFO")
@@ -923,6 +1137,17 @@ def main():
     total_available += available
     refresh_process_path()
 
+    debug_log("Starting Metasploit Framework", "INFO")
+    installed, available = install_metasploit()
+    total_installed += installed
+    total_available += available
+
+    debug_log("Starting John the Ripper", "INFO")
+    installed, available = install_john()
+    total_installed += installed
+    total_available += available
+    refresh_process_path()
+
     debug_log("Starting Python packages", "INFO")
     installed, available = install_python_packages()
     total_installed += installed
@@ -950,20 +1175,20 @@ def main():
     print("  - Containers (Docker Desktop, WSL)")
     print("  - Databases (PostgreSQL 17, MongoDB tools, Redis, SQLite, DBeaver)")
     print("  - Cloud CLIs (AWS, Azure, Google Cloud, Terraform, cloudflared)")
-    print("  - Network and web tools (Nmap, Wireshark, Burp Suite, ZAP, mitmproxy, ffuf)")
-    print("  - Forensics and reversing (Autopsy, ExifTool, Ghidra, x64dbg, ImHex, WinDbg)")
-    print("  - Scoop CLIs (hashcat, gobuster, feroxbuster, amass, jadx, gitleaks, grype)")
+    print("  - Network and web tools (Nmap, Wireshark, Burp Suite, ZAP, mitmproxy, ffuf, Maltego)")
+    print("  - Frameworks (Metasploit Framework, John the Ripper, hashcat)")
+    print("  - Forensics (Autopsy, OSFMount, Volatility Workbench, TestDisk, PhotoRec, YARA)")
+    print("  - Reversing (Ghidra, x64dbg, ImHex, HxD, PE-bear, Resource Hacker, WinDbg)")
+    print("  - Scoop CLIs (gobuster, feroxbuster, amass, jadx, gitleaks, grype)")
     print("  - Python, Node.js, and editor extensions")
     print("=" * 80)
-    print("Not installed from winget or official Scoop, because they are not published there:")
-    print("  - Metasploit Framework (install from Rapid7 if you need it)")
-    print("  - WinPcap (obsolete; Npcap is installed from the Nmap Scoop bundle when present)")
+    print("WinPcap is not installed. It is obsolete; Npcap comes from the Nmap Scoop bundle.")
     print("=" * 80)
     print("Next steps:")
     print("1. Restart so every installer can finish updating PATH")
     print("2. Open VS Code, or Cursor if its CLI is installed, and check the extensions")
     print("3. Check languages: node --version, python --version, go version, rustc --version, java -version")
-    print("4. Check security tools: nmap --version, tshark --version, hashcat --version")
+    print("4. Check security tools: nmap --version, tshark --version, hashcat --version, john, msfconsole")
     print(f"5. Read the debug log: {log_filename}")
     print("=" * 80)
 

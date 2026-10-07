@@ -28,10 +28,12 @@ This script will:
 6. **Install desktop utilities**
 7. **Install Scoop, then tools that winget does not publish** (or only publishes as a stale build)
 8. **Install Npcap from the Nmap Scoop bundle** when that installer is present and Npcap is missing
-9. **Batch-install Python and Node.js packages**
-10. **Install editor extensions**
-11. **List Cloudflare resources** when the Wrangler CLI is on PATH and already logged in
-12. **Print a summary** with restart notes and the log path
+9. **Install Metasploit Framework** from Rapid7's official Windows MSI
+10. **Install John the Ripper** from Openwall's official Windows build and add it to PATH
+11. **Batch-install Python and Node.js packages**
+12. **Install editor extensions**
+13. **List Cloudflare resources** when the Wrangler CLI is on PATH and already logged in
+14. **Print a summary** with restart notes and the log path
 
 Everything is logged to a timestamped debug file. A failed interactive command asks whether to continue. Per-package winget and Scoop failures are logged and skipped.
 
@@ -81,7 +83,7 @@ Follow the prompts. Optional package failures are recorded in the log and the ru
 
 - Docker Desktop
 - Windows Subsystem for Linux
-- PostgreSQL 17, MongoDB Database Tools, Redis, SQLite, DBeaver Community
+- PostgreSQL 17, MongoDB Database Tools, Redis, SQLite, DBeaver Community, DB Browser for SQLite
 
 The winget Redis package is the legacy Windows port (3.0.504). It is the Redis build winget still publishes.
 
@@ -94,9 +96,10 @@ The winget Redis package is the legacy Windows port (3.0.504). It is the Redis b
 
 From winget:
 
-- Wireshark, Burp Suite, ZAP, mitmproxy, ffuf
-- Autopsy, ExifTool, Tesseract OCR, FFmpeg, WinDbg
-- x64dbg, ImHex, Detect It Easy, System Informer
+- Wireshark, Burp Suite, ZAP, mitmproxy, ffuf, Maltego
+- Autopsy (includes The Sleuth Kit), OSFMount, Volatility Workbench, TestDisk, PhotoRec
+- ExifTool, YARA, VirusTotal CLI, Tesseract OCR, FFmpeg, WinDbg
+- x64dbg, ImHex, HxD, PE-bear, Resource Hacker, Detect It Easy, System Informer
 - 7-Zip, Gpg4win, Sysinternals Suite, KeePassXC, VeraCrypt
 
 From Scoop's official `main` and `extras` buckets:
@@ -106,22 +109,24 @@ From Scoop's official `main` and `extras` buckets:
 - apktool, jadx, Ghidra, Cutter, CyberChef
 - gitleaks, Grype, cosign
 
+### Official installers outside winget and Scoop
+
+- **Metasploit Framework.** Rapid7's nightly MSI (`https://windows.metasploit.com/metasploitframework-latest.msi`), installed silently under `C:\Tools`. The download is about 400 MB. `msfconsole` is added to PATH. The MSI is kept in `%APPDATA%\Metasploit`.
+- **John the Ripper.** Openwall's official Windows jumbo build, extracted to `C:\Tools\john`, with the `john.exe` directory added to the machine PATH.
+
 ### Not installed automatically
 
-These used to be named in the script, but neither winget nor Scoop's official buckets publish them now:
-
-- **Metasploit Framework.** Install it from Rapid7 if you need it.
 - **WinPcap.** It is obsolete. Npcap replaces it.
 
 ### Utilities
 
 - PowerToys, .NET 8 SDK, .NET 10 SDK
 - IntelliJ IDEA Community, PyCharm Community, Sublime Text, Notepad++
-- Figma, OBS Studio, PuTTY, WinSCP
+- Figma, OBS Studio, PuTTY, WinSCP, Everything
 
 ### Packages
 
-- Python: requests, Beautiful Soup, Selenium, pandas, NumPy, Matplotlib, Flask, Django, FastAPI, cryptography, Scapy, Impacket, sqlmap, Volatility 3, and related libraries
+- Python: requests, Beautiful Soup, Selenium, pandas, NumPy, Matplotlib, Flask, Django, FastAPI, cryptography, Scapy, Impacket, sqlmap, Volatility 3, oletools, LIEF, python-registry, theHarvester, and related libraries
 - Node.js: TypeScript, ESLint, Prettier, Nodemon, Express, React, Vue, Angular, Jest, Mocha, Cypress, Wrangler, Vercel, Netlify CLI
 
 ### Editor extensions
@@ -154,6 +159,8 @@ Scoop packages must exist in the official `main` or `extras` bucket. The script 
 - **Scoop failed?** The installer is the official `get.scoop.sh` script with `-RunAsAdmin`, which is required because this run is elevated.
 - **Nmap capture does not work?** Npcap has to be installed. The script runs the Npcap installer shipped inside Scoop's Nmap app when `C:\Program Files\Npcap` is missing. If that file is not in the bundle, install Npcap by hand.
 - **Ghidra does not start?** It needs JDK 21 on PATH. The script installs Temurin 21 before Scoop's Ghidra package. Restart the terminal after the run.
+- **Metasploit or John disappeared after install?** Antivirus quarantines both. Exclude `C:\Tools\metasploit-framework`, `C:\metasploit-framework`, and `C:\Tools\john`, then run the script again. Metasploit's MSI log is `%APPDATA%\Metasploit\install.log`.
+- **`john` or `msfconsole` is not found?** Restart the terminal. Both installers update the machine PATH, which already-open shells do not see.
 - **Cloudflare commands failed?** Wrangler has to be installed and logged in (`wrangler login`). The listing commands are skipped when Wrangler is absent, and a failed query does not stop the run.
 - **Redis is very old?** That is the package winget still ships for Windows.
 
@@ -164,7 +171,7 @@ Scoop packages must exist in the official `main` or `extras` bucket. The script 
 1. **Restart** so PATH updates from every installer are picked up.
 2. **Open VS Code** and look through the extensions.
 3. **Check the languages:** `node --version`, `python --version`, `go version`, `rustc --version`, `java -version`
-4. **Check a few security tools:** `nmap --version`, `tshark --version`, `hashcat --version`
+4. **Check a few security tools:** `nmap --version`, `tshark --version`, `hashcat --version`, `john`, `msfconsole`
 5. **Read the log** if anything was skipped.
 
 ---
